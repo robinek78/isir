@@ -1,31 +1,35 @@
 """
 Hlídač insolvence — webová aplikace + automatický monitor
-Flask server: vizuální přehled + REST API pro správu IČO
-Scheduler: každý den zkontroluje ISIR a pošle email při nálezu
+Scraping HTML lustrace z isir.justice.cz — žádné nedokumentované API.
 """
 
-import os, json, time, smtplib, logging, threading, requests, schedule
+import os, json, time, smtplib, logging, threading, requests, schedule, re
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from flask import Flask, jsonify, request, render_template_string
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# --- Konfigurace (nastavte v Render.com jako Environment Variables) ---
 GMAIL_USER     = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "")
 NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "robert@sedlacek.rs")
 CHECK_HOUR     = int(os.environ.get("CHECK_HOUR", "7"))
 DATA_FILE      = Path("data.json")
 
-ISIR_API = "https://isir.justice.cz/isir/common/rest/rizeni?ic={ico}"
-ISIR_WEB = "https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic={ico}&aktualnost=AKTUALNI_I_UKONCENA"
+ISIR_LUSTR = "https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic={ico}&aktualnost=AKTUALNI_I_UKONCENA"
 
 app = Flask(__name__)
 _lock = threading.Lock()
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "cs-CZ,cs;q=0.9",
+}
 
 # --- Datová vrstva ---
 def load_data() -> dict:
@@ -39,48 +43,105 @@ def load_data() -> dict:
 def save_data(d: dict):
     DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2))
 
-# --- ISIR logika ---
+# --- ISIR scraping ---
 def fetch_isir(ico: str) -> dict:
+    """
+    Scrape lustrace stránky ISIR. Vrátí seznam řízení jako dicts.
+    Stránka obsahuje tabulku s výsledky nebo zprávu 'Nic nenalezeno'.
+    """
+    url = ISIR_LUSTR.format(ico=ico)
     try:
-        r = requests.get(ISIR_API.format(ico=ico), headers={"Accept": "application/json"}, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
-            rizeni = data
-        elif isinstance(data, dict):
-            rizeni = data.get("rizeni") or data.get("items") or []
-            if not rizeni and (data.get("spisovaZnacka") or data.get("stav")):
-                rizeni = [data]
-        else:
-            rizeni = []
-        return {"ok": True, "rizeni": rizeni}
-    except Exception as e:
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        return parse_lustrace(soup, ico, url)
+    except requests.exceptions.RequestException as e:
         return {"ok": False, "error": str(e)}
 
-def fmt_date(v):
-    if not v: return None
-    try: return datetime.fromisoformat(v[:10]).strftime("%d. %m. %Y")
-    except: return v
+def parse_lustrace(soup: BeautifulSoup, ico: str, url: str) -> dict:
+    """Parsuje HTML lustrace stránky ISIR."""
+    rizeni = []
 
-def parse_rizeni(r: dict) -> dict:
-    spz = r.get("spisovaZnacka") or r.get("spZn") or r.get("cisloJednaci") or ""
-    dluznik = r.get("dluznik")
-    if not dluznik and r.get("dluznici"):
-        d0 = r["dluznici"][0]
-        dluznik = d0.get("nazev") or " ".join(filter(None,[d0.get("jmeno"), d0.get("prijmeni")])) or None
-    spravce = r.get("insolvencniSpravce")
-    if not spravce and r.get("spravci"):
-        s0 = r["spravci"][0]
-        spravce = s0.get("nazev") or " ".join(filter(None,[s0.get("jmeno"), s0.get("prijmeni")])) or None
-    return {
-        "spz":     spz or None,
-        "soud":    r.get("soud") or r.get("nazevSoudu"),
-        "stav":    r.get("stav") or r.get("stavRizeni"),
-        "druh":    r.get("druhRizeni"),
-        "datum":   fmt_date(r.get("datumZahajeni") or r.get("datumZapisu")),
-        "dluznik": dluznik,
-        "spravce": spravce,
-    }
+    # Najdi tabulku s výsledky
+    # ISIR používá tabulky třídy 'vysledkyTabulka' nebo podobné
+    tables = soup.find_all("table")
+    result_table = None
+    for t in tables:
+        # Hledáme tabulku která má záhlaví s relevantními sloupci
+        headers = [th.get_text(strip=True) for th in t.find_all("th")]
+        if any(kw in " ".join(headers) for kw in ["Spisová", "Soud", "Stav", "znač"]):
+            result_table = t
+            break
+
+    # Zkontroluj zda není "nic nenalezeno"
+    text = soup.get_text()
+    zadny = any(p in text for p in [
+        "Nic nenalezeno", "nebyl nalezen", "nebyly nalezeny",
+        "žádné záznamy", "nenalezeny žádné"
+    ])
+
+    if zadny and not result_table:
+        return {"ok": True, "rizeni": [], "url": url}
+
+    if result_table:
+        rows = result_table.find_all("tr")
+        # První řádek = záhlaví
+        if rows:
+            header_cells = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+        for row in rows[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if not cells or len(cells) < 2:
+                continue
+            # Pokusíme se mapovat buňky na pole
+            rz = {}
+            # Zkus mapování podle záhlaví
+            if header_cells:
+                for i, h in enumerate(header_cells):
+                    if i < len(cells):
+                        h_lower = h.lower()
+                        v = cells[i]
+                        if "znač" in h_lower or "spis" in h_lower:
+                            rz["spz"] = v
+                        elif "soud" in h_lower:
+                            rz["soud"] = v
+                        elif "stav" in h_lower:
+                            rz["stav"] = v
+                        elif "druh" in h_lower or "typ" in h_lower:
+                            rz["druh"] = v
+                        elif "datum" in h_lower or "zah" in h_lower:
+                            rz["datum"] = v
+                        elif "dlužník" in h_lower or "název" in h_lower or "jméno" in h_lower:
+                            rz["dluznik"] = v
+            else:
+                # Fallback — první buňka jako spisová značka
+                rz["spz"] = cells[0] if cells else None
+                rz["soud"] = cells[1] if len(cells) > 1 else None
+                rz["stav"] = cells[2] if len(cells) > 2 else None
+
+            # Odkaz na detail řízení
+            link_tag = row.find("a", href=True)
+            if link_tag:
+                href = link_tag["href"]
+                if not href.startswith("http"):
+                    href = "https://isir.justice.cz" + href
+                rz["isir_url"] = href
+            else:
+                rz["isir_url"] = url
+
+            # Přidej jen neprázdné záznamy
+            if any(v for v in rz.values() if v and v.strip()):
+                rizeni.append(rz)
+
+    # Fallback: pokud tabulka nebyla nalezena ale stránka existuje a není "nic nenalezeno"
+    # — považujeme za chybu parsování, ne za "bez řízení"
+    if not result_table and not zadny:
+        # Zkus najít alespoň spisové značky v textu
+        spz_pattern = re.findall(r'[A-Z]{4,5}\s*\d+\s*INS\s*\d+/\d{4}', text)
+        for spz in set(spz_pattern):
+            rizeni.append({"spz": spz.strip(), "isir_url": url})
+
+    return {"ok": True, "rizeni": rizeni, "url": url}
 
 # --- Kontrola ---
 def run_check(notify=True):
@@ -96,16 +157,25 @@ def run_check(notify=True):
         log.info(f"  {s['nazev']} ({ico})")
         res = fetch_isir(ico)
         ts = datetime.now().isoformat()
+
         if not res["ok"]:
             results_new[ico] = {"status": "error", "error": res["error"], "ts": ts, "has_rizeni": False, "rizeni": []}
             log.warning(f"    Chyba: {res['error']}")
-            time.sleep(0.5)
+            time.sleep(1)
             continue
-        rizeni = [parse_rizeni(r) for r in res["rizeni"]]
+
+        rizeni = res["rizeni"]
         has = len(rizeni) > 0
-        results_new[ico] = {"status": "ok", "has_rizeni": has, "rizeni": rizeni, "ts": ts}
+        results_new[ico] = {
+            "status": "ok",
+            "has_rizeni": has,
+            "rizeni": rizeni,
+            "ts": ts,
+            "url": res.get("url", ISIR_LUSTR.format(ico=ico))
+        }
+
         if has and notify:
-            znacky = sorted(set(r["spz"] or str(i) for i, r in enumerate(rizeni)))
+            znacky = sorted(set(r.get("spz") or str(i) for i, r in enumerate(rizeni)))
             klic = ",".join(znacky)
             if d["known"].get(ico) != klic:
                 nove.append({"ico": ico, "nazev": s["nazev"], "rizeni": rizeni})
@@ -116,7 +186,8 @@ def run_check(notify=True):
         elif not has:
             d["known"].pop(ico, None)
             log.info(f"    Bez řízení")
-        time.sleep(0.8)
+
+        time.sleep(1.5)  # slušnost vůči serveru
 
     with _lock:
         d2 = load_data()
@@ -131,19 +202,19 @@ def run_check(notify=True):
 
 def send_email(nalezene):
     if not GMAIL_USER or not GMAIL_APP_PASS:
-        log.error("Gmail není nakonfigurován — přidejte GMAIL_USER a GMAIL_APP_PASS do Environment Variables")
+        log.error("Gmail není nakonfigurován")
         return
     datum = datetime.now().strftime("%d. %m. %Y")
     predmet = f"⚠️ Hlídač insolvence: nový nález ({len(nalezene)} IČO) — {datum}"
     radky = [f"Hlídač insolvence — {datum}\n"]
     for n in nalezene:
         radky += [f"\n{'─'*50}", f"SUBJEKT: {n['nazev']}  (IČO: {n['ico']})",
-                  f"Odkaz:   {ISIR_WEB.format(ico=n['ico'])}\n"]
+                  f"Odkaz:   {ISIR_LUSTR.format(ico=n['ico'])}\n"]
         for i, rz in enumerate(n["rizeni"], 1):
             radky.append(f"  Řízení č. {i}:")
-            for k, v in [("Spisová značka", rz["spz"]),("Soud", rz["soud"]),("Stav", rz["stav"]),
-                         ("Druh", rz["druh"]),("Datum zahájení", rz["datum"]),
-                         ("Dlužník", rz["dluznik"]),("Ins. správce", rz["spravce"])]:
+            for k, v in [("Spisová značka", rz.get("spz")), ("Soud", rz.get("soud")),
+                         ("Stav", rz.get("stav")), ("Druh", rz.get("druh")),
+                         ("Datum zahájení", rz.get("datum")), ("Dlužník", rz.get("dluznik"))]:
                 if v: radky.append(f"    {(k+':'):<18} {v}")
             radky.append("")
     msg = MIMEMultipart()
@@ -303,81 +374,63 @@ input[type=text]:focus{outline:none;border-color:var(--text)}
 </main>
 <script>
 let subjects=[],results={},lastCheck=null,checking=false;
-
-async function api(m,p,b){
-  const o={method:m,headers:{'Content-Type':'application/json'}};
-  if(b)o.body=JSON.stringify(b);
-  return (await fetch(p,o)).json();
-}
-async function load(){
-  const [s,r]=await Promise.all([api('GET','/api/subjects'),api('GET','/api/results')]);
-  subjects=s; results=r.results||{}; lastCheck=r.last_check; render();
-}
+async function api(m,p,b){const o={method:m,headers:{'Content-Type':'application/json'}};if(b)o.body=JSON.stringify(b);return (await fetch(p,o)).json();}
+async function load(){const [s,r]=await Promise.all([api('GET','/api/subjects'),api('GET','/api/results')]);subjects=s;results=r.results||{};lastCheck=r.last_check;render();}
 async function add(){
   const ico=document.getElementById('icoIn').value.trim().replace(/\D/g,'').padStart(8,'0');
   const nazev=document.getElementById('nameIn').value.trim();
-  const e=document.getElementById('err'); e.textContent='';
+  const e=document.getElementById('err');e.textContent='';
   if(!/^\d{8}$/.test(ico)){e.textContent='IČO musí mít 8 číslic.';return;}
   const r=await api('POST','/api/subjects',{ico,nazev});
   if(r.error){e.textContent=r.error;return;}
-  document.getElementById('icoIn').value='';
-  document.getElementById('nameIn').value='';
+  document.getElementById('icoIn').value='';document.getElementById('nameIn').value='';
   await load();
 }
-async function del(ico){
-  if(!confirm('Odebrat IČO '+ico+' ze sledování?'))return;
-  await api('DELETE','/api/subjects/'+ico); await load();
-}
+async function del(ico){if(!confirm('Odebrat IČO '+ico+' ze sledování?'))return;await api('DELETE','/api/subjects/'+ico);await load();}
 async function checkNow(){
-  if(checking)return;
-  checking=true;
-  const btn=document.getElementById('btnNow');
-  btn.disabled=true; btn.textContent='Kontroluji…';
+  if(checking)return;checking=true;
+  const btn=document.getElementById('btnNow');btn.disabled=true;btn.textContent='Kontroluji…';
   document.getElementById('progWrap').style.display='block';
   const prev=lastCheck;
   await api('POST','/api/check');
   let t=0;
   const iv=setInterval(async()=>{
-    t+=2; document.getElementById('pf').style.width=Math.min(88,t/(subjects.length*2+4)*100)+'%';
+    t+=2;document.getElementById('pf').style.width=Math.min(88,t/(subjects.length*3+4)*100)+'%';
     const r=await api('GET','/api/results');
     if(r.last_check&&r.last_check!==prev){
-      clearInterval(iv); results=r.results||{}; lastCheck=r.last_check;
-      checking=false; btn.disabled=false; btn.textContent='Zkontrolovat nyní';
+      clearInterval(iv);results=r.results||{};lastCheck=r.last_check;
+      checking=false;btn.disabled=false;btn.textContent='Zkontrolovat nyní';
       document.getElementById('progWrap').style.display='none';
-      document.getElementById('pf').style.width='0';
-      render();
+      document.getElementById('pf').style.width='0';render();
     }
-    if(t>180){clearInterval(iv);checking=false;btn.disabled=false;btn.textContent='Zkontrolovat nyní';}
+    if(t>300){clearInterval(iv);checking=false;btn.disabled=false;btn.textContent='Zkontrolovat nyní';}
   },2000);
 }
 function ts(iso){try{return new Date(iso).toLocaleString('cs-CZ');}catch{return iso;}}
 function render(){
   document.getElementById('lc').textContent=lastCheck?'Poslední kontrola: '+ts(lastCheck):'';
-  // Tags
   const tg=document.getElementById('tags');
   tg.innerHTML=subjects.length?subjects.map(s=>`<div class="tag"><div><div class="tag-name">${s.nazev}</div><div class="tag-ico">${s.ico}</div></div><button class="tag-del" onclick="del('${s.ico}')">×</button></div>`).join(''):'<div class="empty">Zatím žádná IČO</div>';
-  // Results
   const rl=document.getElementById('rl');
   if(!subjects.length){rl.innerHTML='<div class="empty" style="padding:2rem 0">Přidejte IČO a spusťte kontrolu.</div>';document.getElementById('sb').innerHTML='';return;}
   let wc=0;
   rl.innerHTML=subjects.map(s=>{
     const r=results[s.ico];
     const meta='IČO: '+s.ico+(r&&r.ts?' · '+ts(r.ts):'');
-    if(!r) return row(s,meta,'<span class="badge b-muted">Nekontrolováno</span>','');
-    if(r.status==='error') return row(s,meta,'<span class="badge b-warn">Chyba</span>',`<div class="no-rz">${r.error}</div>`);
-    if(r.has_rizeni) wc++;
+    if(!r)return row(s,meta,'<span class="badge b-muted">Nekontrolováno</span>','');
+    if(r.status==='error')return row(s,meta,'<span class="badge b-warn">Chyba</span>',`<div class="no-rz">${r.error}</div><a class="lustr" href="https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic=${s.ico}&aktualnost=AKTUALNI_I_UKONCENA" target="_blank">Ověřit ručně v ISIR →</a>`);
+    if(r.has_rizeni)wc++;
     const badge=r.has_rizeni?'<span class="badge b-warn">Řízení zahájeno</span>':'<span class="badge b-ok">Bez řízení</span>';
     const det=r.has_rizeni?(r.rizeni||[]).map(rz=>rzbox(rz,s.ico)).join(''):'<div class="no-rz">Žádný záznam v insolvenčním rejstříku.</div>';
-    return row(s,meta,badge,det+`<a class="lustr" href="https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic=${s.ico}&aktualnost=AKTUALNI_I_UKONCENA" target="_blank">Otevřít lustraci v ISIR →</a>`);
+    const lustrUrl=`https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic=${s.ico}&aktualnost=AKTUALNI_I_UKONCENA`;
+    return row(s,meta,badge,det+`<a class="lustr" href="${lustrUrl}" target="_blank">Otevřít lustraci v ISIR →</a>`);
   }).join('');
-  document.getElementById('sb').innerHTML=wc?`<span class="badge b-warn">${wc} s řízením`:'';
+  document.getElementById('sb').innerHTML=wc?`<span class="badge b-warn">${wc} s řízením</span>`:'';
 }
-function row(s,meta,badge,det){
-  return`<div class="ri"><div class="ri-top"><div><div class="ri-name">${s.nazev}</div><div class="ri-meta">${meta}</div></div>${badge}</div>${det}</div>`;
-}
+function row(s,meta,badge,det){return`<div class="ri"><div class="ri-top"><div><div class="ri-name">${s.nazev}</div><div class="ri-meta">${meta}</div></div>${badge}</div>${det}</div>`;}
 function rzbox(rz,ico){
-  const fields=[['Spisová značka',rz.spz],['Soud',rz.soud],['Stav řízení',rz.stav],['Druh řízení',rz.druh],['Datum zahájení',rz.datum],['Dlužník',rz.dluznik],['Ins. správce',rz.spravce]].filter(([,v])=>v);
-  const link=rz.spz?`https://isir.justice.cz/isir/ueu/rizeni_detail.do?id=${encodeURIComponent(rz.spz)}`:`https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic=${ico}&aktualnost=AKTUALNI_I_UKONCENA`;
+  const fields=[['Spisová značka',rz.spz],['Soud',rz.soud],['Stav řízení',rz.stav],['Druh řízení',rz.druh],['Datum zahájení',rz.datum],['Dlužník',rz.dluznik]].filter(([,v])=>v);
+  const link=rz.isir_url||`https://isir.justice.cz/isir/ueu/vysledek_lustrace.do?ic=${ico}&aktualnost=AKTUALNI_I_UKONCENA`;
   return`<div class="rzbox"><div class="rzhead">Insolvenční řízení</div><table class="rzt">${fields.map(([k,v])=>`<tr><td class="rk">${k}</td><td class="rv">${v}</td></tr>`).join('')}</table><a class="rzlink" href="${link}" target="_blank">Zobrazit v insolvenčním rejstříku →</a></div>`;
 }
 load();
@@ -389,7 +442,6 @@ load();
 def index():
     return render_template_string(HTML)
 
-# --- Scheduler vlákno ---
 def scheduler_thread():
     log.info(f"Scheduler spuštěn — denní kontrola v {CHECK_HOUR:02d}:00")
     schedule.every().day.at(f"{CHECK_HOUR:02d}:00").do(run_check)
